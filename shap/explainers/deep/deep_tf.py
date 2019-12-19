@@ -75,6 +75,7 @@ class TFDeepExplainer(Explainer):
             except:
                 pass
 
+        self.model = model
         # determine the model inputs and outputs
         if str(type(model)).endswith("keras.engine.sequential.Sequential'>"):
             self.model_inputs = model.inputs
@@ -109,29 +110,35 @@ class TFDeepExplainer(Explainer):
         self._vinputs = {} # used to track what op inputs depends on the model inputs
         self.orig_grads = {}
         
-        # if we are not given a session find a default session
-        if session is None:
-            # if keras is installed and already has a session then use it
-            ksess = None
-            if hasattr(keras.backend.tensorflow_backend, "_SESSION"):
-                ksess = keras.backend.tensorflow_backend._SESSION
-            elif hasattr(keras.backend.tensorflow_backend.tf_keras_backend._SESSION, "session"):
-                ksess = keras.backend.tensorflow_backend.tf_keras_backend._SESSION.session
-            if keras is not None and ksess is not None:
-                session = keras.backend.get_session()
-            else:
-                try:
-                    session = tf.compat.v1.keras.backend.get_session()
-                except:
-                    session = tf.keras.backend.get_session()
-        self.session = tf.get_default_session() if session is None else session
+        if not tf.executing_eagerly():
+            # if we are not given a session find a default session
+            if session is None:
+                # if keras is installed and already has a session then use it
+                ksess = None
+                if hasattr(keras.backend.tensorflow_backend, "_SESSION"):
+                    ksess = keras.backend.tensorflow_backend._SESSION
+                elif hasattr(keras.backend.tensorflow_backend.tf_keras_backend._SESSION, "session"):
+                    ksess = keras.backend.tensorflow_backend.tf_keras_backend._SESSION.session
+                if keras is not None and ksess is not None:
+                    session = keras.backend.get_session()
+                else:
+                    try:
+                        session = tf.compat.v1.keras.backend.get_session()
+                    except:
+                        session = tf.keras.backend.get_session()
+                self.session = tf.get_default_session() if session is None else session
 
         # if no learning phase flags were given we go looking for them
         # ...this will catch the one that keras uses
         # we need to find them since we want to make sure learning phase flags are set to False
         if learning_phase_flags is None:
             self.learning_phase_ops = []
-            for op in self.session.graph.get_operations():
+            if not tf.executing_eagerly():
+                if self.session is not None:
+                    graph = self.session.graph
+            else:
+                graph = self.model_inputs[0].graph
+            for op in graph.get_operations():
                 if 'learning_phase' in op.name and op.type == "Const" and len(op.outputs[0].shape) == 0:
                     if op.outputs[0].dtype == tf.bool:
                         self.learning_phase_ops.append(op)
@@ -146,7 +153,10 @@ class TFDeepExplainer(Explainer):
         else:
             if self.data[0].shape[0] > 5000:
                 warnings.warn("You have provided over 5k background samples! For better performance consider using smaller random sample.")
-            self.expected_value = self.run(self.model_output, self.model_inputs, self.data).mean(0)
+            if not tf.executing_eagerly():
+                self.expected_value = self.run(self.model_output, self.model_inputs, self.data).mean(0)
+            else:
+                self.expected_value = self.run(self.gradient_function, self.model_inputs, self.data).mean(0)
 
         # find all the operations in the graph between our inputs and outputs
         tensor_blacklist = tensors_blocked_by_false(self.learning_phase_ops) # don't follow learning phase branches
@@ -177,6 +187,24 @@ class TFDeepExplainer(Explainer):
                 self.phi_symbolics = [None for i in range(noutputs)]
             else:
                 raise Exception("The model output tensor to be explained cannot have a static shape in dim 1 of None!")
+
+    @property
+    def gradient_function(self):
+        @tf.function
+        def grad_graph(x):
+            phase = tf.keras.backend.learning_phase()
+            tf.keras.backend.set_learning_phase(0)
+
+            with tf.GradientTape(watch_accessed_variables=False) as tape:
+                tape.watch(x)
+                out = self.model(x)
+
+            x_grad = tape.gradient(out, x)
+            
+            tf.keras.backend.set_learning_phase(phase)
+            
+            return x_grad
+        return grad_graph
 
     def _variable_inputs(self, op):
         """ Return which inputs of this operation are variable (i.e. depend on the model inputs).
@@ -293,10 +321,45 @@ class TFDeepExplainer(Explainer):
     def run(self, out, model_inputs, X):
         """ Runs the model while also setting the learning phase flags to False.
         """
-        feed_dict = dict(zip(model_inputs, X))
-        for t in self.learning_phase_flags:
-            feed_dict[t] = False
-        return self.session.run(out, feed_dict)
+        print(model_inputs)
+        print(X)
+        print(type(model_inputs))
+        if not tf.executing_eagerly():
+            feed_dict = dict(zip(model_inputs, X))
+            for t in self.learning_phase_flags:
+                feed_dict[t] = False
+            return self.session.run(out, feed_dict)
+        else:
+            # build inputs that are correctly shaped, typed, and tf-wrapped
+            inputs = []
+            for i in range(len(X)):
+                if self.model_inputs[i].shape[1] is not None:
+                    shape = list(self.model_inputs[i].shape)
+                    shape[0] = -1
+                    data = X[i].reshape(shape)
+                else:
+                    shape = list(self.model_inputs[i].shape)
+                    shape[0] = -1
+                    # shape[1] = X[i].shape[1]
+                    data = X[i].reshape(shape)
+                # print("IM X[i]: ")
+                # print(X[i])
+                # print(self.model_inputs[i])
+                # print("IM dtype: ")
+                # print(self.model_inputs[i].dtype)
+                # print("IM shape: ")
+                # print(shape)
+                # print(X[i].reshape(shape))
+                v = tf.constant(data, dtype=self.model_inputs[i].dtype)
+                inputs.append(v)
+            # import pdb; pdb.set_trace()
+            print("out: ")
+            print(out)
+            print("inputs: ")
+            print(inputs)
+            print("otuput: ")
+            print(out(inputs))
+            return np.array(out(inputs)[0])
 
     def custom_grad(self, op, *grads):
         """ Passes a gradient op creation request to the correct handler.

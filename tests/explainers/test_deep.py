@@ -178,13 +178,14 @@ def test_keras_imdb_lstm():
 
     # explain a prediction and make sure it sums to the difference between the average output
     # over the background samples and the current output
-    tf.keras.backend.get_session().run(tf.global_variables_initializer())
+    #tf.keras.backend.get_session().run(tf.global_variables_initializer())
     e = shap.DeepExplainer((mod.layers[0].input, mod.layers[-1].output), background)
     shap_values = e.shap_values(testx)
     sums = np.array([shap_values[i].sum() for i in range(len(shap_values))])
-    sess = tf.keras.backend.get_session()
-    diff = sess.run(mod.layers[-1].output, feed_dict={mod.layers[0].input: testx})[0,:] - \
-        sess.run(mod.layers[-1].output, feed_dict={mod.layers[0].input: background}).mean(0)
+    diff = mod.layers[-1].output()(testx)
+    #sess = tf.keras.backend.get_session()
+    #diff = sess.run(mod.layers[-1].output, feed_dict={mod.layers[0].input: testx})[0,:] - \
+    #    sess.run(mod.layers[-1].output, feed_dict={mod.layers[0].input: background}).mean(0)
     assert np.allclose(sums, diff, atol=1e-06), "Sum of SHAP values does not match difference!"
 
 def test_tf_keras_imdb_lstm():

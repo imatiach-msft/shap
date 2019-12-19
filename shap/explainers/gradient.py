@@ -43,7 +43,6 @@ class GradientExplainer(Explainer):
             over these samples. The data passed here must match the input tensors given in the
             first argument. Single element lists can be passed unwrapped.
         """
-
         # first, we need to find the framework
         if type(model) is tuple:
             a, b = model
@@ -159,6 +158,7 @@ class _TFGradientExplainer(Explainer):
         self.local_smoothing = local_smoothing
 
         if not tf.executing_eagerly():
+            print("executing NOT eagerly")
             # if we are not given a session find a default session
             if session is None:
                 # if keras is installed and already has a session then use it
@@ -180,6 +180,8 @@ class _TFGradientExplainer(Explainer):
             for op in self.session.graph.get_operations():
                 if 'keras_learning_phase' in op.name:
                     self.keras_phase_placeholder = op.outputs[0]
+        else:
+            print("executing EAGERLY")
 
         # save the expected output of the model
         #self.expected_value = self.run(self.model_output, self.model_inputs, self.data).mean(0)
@@ -192,9 +194,11 @@ class _TFGradientExplainer(Explainer):
     def gradient(self, i):
         if self.gradients[i] is None:
             if not tf.executing_eagerly():
+                print("executing NOT eagerly")
                 out = self.model_output[:,i] if self.multi_output else self.model_output
                 self.gradients[i] = tf.gradients(out, self.model_inputs)
             else:
+                print("executing EAGERLY")
                 @tf.function
                 def grad_graph(x):
                     phase = tf.keras.backend.learning_phase()
@@ -227,6 +231,7 @@ class _TFGradientExplainer(Explainer):
         assert len(self.model_inputs) == len(X), "Number of model inputs does not match the number given!"
 
         # rank and determine the model outputs that we will explain
+        print("in shap values....")
         if not tf.executing_eagerly():
             model_output_values = self.run(self.model_output, self.model_inputs, X)
         else:
@@ -350,6 +355,12 @@ class _TFGradientExplainer(Explainer):
                 shape[0] = -1
                 v = tf.constant(X[i].reshape(shape), dtype=self.model_inputs[i].dtype)
                 inputs.append(v)
+            print("out: ")
+            print(out)
+            print("inputs: ")
+            print(inputs)
+            print("otuput: ")
+            print(out(inputs))
             return out(inputs)
 
 
