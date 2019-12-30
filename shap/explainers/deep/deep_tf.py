@@ -209,9 +209,13 @@ class TFDeepExplainer(Explainer):
     def _variable_inputs(self, op):
         """ Return which inputs of this operation are variable (i.e. depend on the model inputs).
         """
-        if op.name not in self._vinputs:
-            self._vinputs[op.name] = np.array([t.op in self.between_ops or t in self.model_inputs for t in op.inputs])
-        return self._vinputs[op.name]
+        print("op inputs inputs: ")
+        print(op.inputs._inputs)
+        print("between ops: ")
+        print(self.between_ops)
+        if op.type not in self._vinputs:
+            self._vinputs[op.type] = np.array([t.op in self.between_ops or t in self.model_inputs for t in op.inputs])
+        return self._vinputs[op.type]
 
     def phi_symbolic(self, i):
         """ Get the SHAP value computation graph for a given model output.
@@ -236,9 +240,25 @@ class TFDeepExplainer(Explainer):
             
             # define the computation graph for the attribution values using custom a gradient-like computation
             try:
-                out = self.model_output[:,i] if self.multi_output else self.model_output
-                self.phi_symbolics[i] = tf.gradients(out, self.model_inputs)
-
+                if not tf.executing_eagerly():
+                    out = self.model_output[:,i] if self.multi_output else self.model_output
+                    self.phi_symbolics[i] = tf.gradients(out, self.model_inputs)
+                else:
+                    inputs = []
+                    for i in range(len(self.data)):
+                        shape = list(self.model_inputs[i].shape)
+                        shape[0] = -1
+                        data = self.data[i].reshape(shape)
+                        v = tf.constant(data, dtype=self.model_inputs[i].dtype)
+                        inputs.append(v)
+                    out = self.model
+                    with tf.GradientTape() as tape:
+                        tape.watch(inputs)
+                        preds = out(inputs)
+                    grads = tape.gradient(preds, inputs)
+                    print("grads: ")
+                    print(grads)
+                    self.phi_symbolics[i] = grads
             finally:
 
                 # reinstate the backpropagatable check
