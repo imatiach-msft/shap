@@ -344,6 +344,7 @@ class TFDeepExplainer(Explainer):
                 # run attribution computation graph
                 feature_ind = model_output_ranks[j,i]
                 sample_phis = self.run(self.phi_symbolic(feature_ind), self.model_inputs, joint_input)
+                # import pdb; pdb.set_trace()
 
                 # assign the attributions to the right part of the output arrays
                 for l in range(len(X)):
@@ -392,7 +393,7 @@ class TFDeepExplainer(Explainer):
                 final_out = out(inputs)
                 print(out)
                 print("final_out", final_out)
-                print("sym", self.phi_symbolics[0]([tf.cast(np.array([[1.], [1.]]), tf.float32)]))
+                # print("sym", self.phi_symbolics[0]([tf.cast(np.array([[1.], [1.]]), tf.float32)]))
                 tf_execute.record_gradient = tf_backprop._record_gradient
 
                 return final_out
