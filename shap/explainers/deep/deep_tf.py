@@ -16,7 +16,7 @@ def custom_record_gradient(op_name, inputs, attrs, results, name):
     get called for ResourceGather operations. In order to make this work we
     temporarily "lie" about the input type to prevent the node from getting
     pruned from the gradient backprop process. We then reset the type directly
-    afterwards back to what it what (an integer type).
+    afterwards back to what it was (an integer type).
     """
 
     if op_name == "ResourceGather":
@@ -183,7 +183,6 @@ class TFDeepExplainer(Explainer):
             if not tf.executing_eagerly():
                 self.expected_value = self.run(self.model_output, self.model_inputs, self.data).mean(0)
             else:
-                # self.expected_value = self.run(self.gradient_function, self.model_inputs, self.data).mean(0)
                 self.expected_value = tf.reduce_mean(self.model(self.data), 0)
 
         # find all the operations in the graph between our inputs and outputs
@@ -224,47 +223,15 @@ class TFDeepExplainer(Explainer):
             else:
                 raise Exception("The model output tensor to be explained cannot have a static shape in dim 1 of None!")
 
-    @property
-    def gradient_function(self):
-        @tf.function
-        def grad_graph(x):
-            phase = tf.keras.backend.learning_phase()
-            tf.keras.backend.set_learning_phase(0)
-
-            with tf.GradientTape(watch_accessed_variables=False) as tape:
-                tape.watch(x)
-                out = self.model(x)
-
-            x_grad = tape.gradient(out, x)
-            
-            tf.keras.backend.set_learning_phase(phase)
-            
-            return x_grad
-        return grad_graph
-
     def _variable_inputs(self, op):
         """ Return which inputs of this operation are variable (i.e. depend on the model inputs).
         """
-        print("op inputs inputs: ")
-        print(op.inputs._inputs)
-        print("between ops: ")
-        print(self.between_ops)
-        print("between tensors: ")
-        print(self.between_tensors)
-        # val = np.array([t.name in self.between_tensors for t in op.inputs])
-        # for t in op.inputs:
-        #     print(t.name, t.name in self.between_tensors)
-        # return val
-        print("op type: ")
-        print(op.type)
-        def tensor_in_inputs(input_tensor):
-            for tensor in self.model_inputs:
-                if input_tensor.shape == tensor.shape and tf.equals(input_tensor.op, tensor.op):
-                    return True
-            return False
-        if op.type not in self._vinputs:
-            self._vinputs[op.type] = np.array([t.op in self.between_tensors or tensor_in_inputs(t) for t in op.inputs])
-        return self._vinputs[op.type]
+        if op not in self._vinputs:
+            out = np.zeros(len(op.inputs), dtype=np.bool)
+            for i,t in enumerate(op.inputs):
+                out[i] = t.name in self.between_tensors
+            self._vinputs[op] = out
+        return self._vinputs[op]
 
     def phi_symbolic(self, i):
         """ Get the SHAP value computation graph for a given model output.
@@ -278,16 +245,40 @@ class TFDeepExplainer(Explainer):
                 self.phi_symbolics[i] = self.execute_with_overridden_gradients(anon)
             else:
                 @tf.function
-                def grad_graph(x):
+                def grad_graph(shap_rAnD):
                     phase = tf.keras.backend.learning_phase()
                     tf.keras.backend.set_learning_phase(0)
                     
                     with tf.GradientTape(watch_accessed_variables=False) as tape:
-                        tape.watch(x)
-                        out = self.model(x)
+                        tape.watch(shap_rAnD)
+                        out = self.model(shap_rAnD)
                         if self.multi_output:
                             out = out[:,i]
-                    x_grad = tape.gradient(out, x)
+                    
+                    # find all the operations in the graph between our inputs and outputs
+                    tensor_blacklist = tensors_blocked_by_false(self.learning_phase_ops) # don't follow learning phase branches
+                    dependence_breakers = [k for k in op_handlers if op_handlers[k] == break_dependence]
+                    back_ops = backward_walk_ops(
+                        [out.op], tensor_blacklist,
+                        dependence_breakers
+                    )
+                    self.between_ops = forward_walk_ops(
+                        [op for op in t.consumers() for t in shap_rAnD],
+                        tensor_blacklist, dependence_breakers,
+                        within_ops=back_ops
+                    )
+                    print("between ops in gradient tape: ")
+                    print(self.between_ops)
+
+                    # note all the tensors that are on the path between the inputs and the output
+                    self.between_tensors = {}
+                    for op in self.between_ops:
+                        for t in op.outputs:
+                            self.between_tensors[t.name] = True
+                    for t in shap_rAnD:
+                        self.between_tensors[t.name] = True
+
+                    x_grad = tape.gradient(out, shap_rAnD)
                     
                     tf.keras.backend.set_learning_phase(phase)
                     
@@ -337,14 +328,16 @@ class TFDeepExplainer(Explainer):
                         bg_data = [bg_data]
                 else:
                     bg_data = self.data
+                
                 # tile the inputs to line up with the background data samples
                 tiled_X = [np.tile(X[l][j:j+1], (bg_data[l].shape[0],) + tuple([1 for k in range(len(X[l].shape)-1)])) for l in range(len(X))]
+                
                 # we use the first sample for the current sample and the rest for the references
                 joint_input = [np.concatenate([tiled_X[l], bg_data[l]], 0) for l in range(len(X))]
+                
                 # run attribution computation graph
                 feature_ind = model_output_ranks[j,i]
                 sample_phis = self.run(self.phi_symbolic(feature_ind), self.model_inputs, joint_input)
-                # import pdb; pdb.set_trace()
 
                 # assign the attributions to the right part of the output arrays
                 for l in range(len(X)):
@@ -352,12 +345,23 @@ class TFDeepExplainer(Explainer):
 
             output_phis.append(phis[0] if not self.multi_input else phis)
         
+        # check that the SHAP values sum up to the model output
         if check_additivity:
-            self.expected_value = self.run(self.model_output, self.model_inputs, self.data).mean(0)
-            model_output = self.run(self.model_output, self.model_inputs, X)
-            for l in range(len(X)):
-                diffs = model_output[:, l] - self.expected_value[l] - output_phis[l].sum(axis=tuple(range(1, output_phis[l].ndim)))
+            if not tf.executing_eagerly():
+                model_output = self.run(self.model_output, self.model_inputs, X)
+            else:
+                model_output = self.model(X)
+            for l in range(len(self.expected_value)):
+                if not self.multi_input:
+                    diffs = model_output[:, l] - self.expected_value[l] - output_phis[l].sum(axis=tuple(range(1, output_phis[l].ndim)))
+                else:
+                    diffs = model_output[:, l] - self.expected_value[l]
+                    for i in range(len(output_phis[l])):
+                        diffs -= output_phis[l][i].sum(axis=tuple(range(1, output_phis[l][i].ndim)))
+                
                 assert np.abs(diffs).max() < 1e-4, "Explanations do not sum up to the model's output! Please post as a github issue."
+        
+        
         if not self.multi_output:
             return output_phis[0]
         elif ranked_outputs is not None:
@@ -368,9 +372,7 @@ class TFDeepExplainer(Explainer):
     def run(self, out, model_inputs, X):
         """ Runs the model while also setting the learning phase flags to False.
         """
-        print(model_inputs)
-        print(X)
-        print(type(model_inputs))
+
         if not tf.executing_eagerly():
             feed_dict = dict(zip(model_inputs, X))
             for t in self.learning_phase_flags:
@@ -386,14 +388,9 @@ class TFDeepExplainer(Explainer):
                     shape = list(self.model_inputs[i].shape)
                     shape[0] = -1
                     data = X[i].reshape(shape)
-                    #v = tf.constant(X[i].reshape(shape), dtype=self.model_inputs[i].dtype)
-                    # v = tf.cast(X[i].reshape(shape), self.model_inputs[i].dtype)
                     v = tf.constant(data, dtype=self.model_inputs[i].dtype)
                     inputs.append(v)
                 final_out = out(inputs)
-                print(out)
-                print("final_out", final_out)
-                # print("sym", self.phi_symbolics[0]([tf.cast(np.array([[1.], [1.]]), tf.float32)]))
                 tf_execute.record_gradient = tf_backprop._record_gradient
 
                 return final_out
@@ -402,6 +399,7 @@ class TFDeepExplainer(Explainer):
     def custom_grad(self, op, *grads):
         """ Passes a gradient op creation request to the correct handler.
         """
+        
         return op_handlers[op.type](self, op, *grads)
 
     def execute_with_overridden_gradients(self, f):
@@ -412,9 +410,7 @@ class TFDeepExplainer(Explainer):
             if n in reg:
                 self.orig_grads[n] = reg[n]["type"]
                 reg[n]["type"] = self.custom_grad
-                #print("lookup ", tf_ops._gradient_registry.lookup("ResourceGather"))
-            # elif n in self.used_types:
-            #     raise Exception(n + " was used in the model but is not in the gradient registry!")
+
         # In TensorFlow 1.10 they started pruning out nodes that they think can't be backpropped
         # unfortunately that includes the index of embedding layers so we disable that check here
         if hasattr(tf_gradients_impl, "_IsBackpropagatable"):
@@ -433,7 +429,7 @@ class TFDeepExplainer(Explainer):
             for n in op_handlers:
                 if n in reg:
                     reg[n]["type"] = self.orig_grads[n]
-        return out
+        return [v.numpy() for v in out]
 
 def tensors_blocked_by_false(ops):
     """ Follows a set of ops assuming their value is False and find blocked Switch paths.
@@ -532,7 +528,7 @@ def gather(explainer, op, *grads):
     if var[1] and not var[0]:
         assert len(indices.shape) == 2, "Only scalar indices supported right now in GatherV2!"
 
-        xin1,rin1 = tf.split(tf.to_float(op.inputs[1]), 2)
+        xin1,rin1 = tf.split(tf.cast(op.inputs[1], tf.float32), 2)
         xout,rout = tf.split(op.outputs[0], 2)
         dup_in1 = [2] + [1 for i in xin1.shape[1:]]
         dup_out = [2] + [1 for i in xout.shape[1:]]
@@ -587,20 +583,27 @@ def nonlinearity_1d(input_ind):
 
 def nonlinearity_1d_handler(input_ind, explainer, op, *grads):
 
+    print("in nonlinearity_1d_handler", op)
+    print(op.type)
+    # print(op.name)
     # make sure only the given input varies
-    for i in range(len(op.inputs)):
+    op_inputs = op.inputs
+    if op_inputs is None:
+        op_inputs = op.outputs[0].op.inputs
+
+    for i in range(len(op_inputs)):
         if i != input_ind:
             assert not explainer._variable_inputs(op)[i], str(i) + "th input to " + op.name + " cannot vary!"
     
-    xin0,rin0 = tf.split(op.inputs[input_ind], 2)
+    xin0,rin0 = tf.split(op_inputs[input_ind], 2)
     xout,rout = tf.split(op.outputs[input_ind], 2)
     delta_in0 = xin0 - rin0
     dup0 = [2] + [1 for i in delta_in0.shape[1:]]
-    out = [None for _ in op.inputs]
+    out = [None for _ in op_inputs]
     orig_grads = explainer.orig_grads[op.type](op, grads[0])
     out[input_ind] = tf.where(
         tf.tile(tf.abs(delta_in0), dup0) < 1e-6,
-        orig_grads[input_ind] if len(op.inputs) > 1 else orig_grads,
+        orig_grads[input_ind] if len(op_inputs) > 1 else orig_grads,
         grads[0] * tf.tile((xout - rout) / delta_in0, dup0)
     )
     return out
