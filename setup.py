@@ -109,10 +109,9 @@ def compile_cuda_module(host_args):
     cuda_home, nvcc = get_cuda_path()
 
     print("NVCC ==> ", nvcc)
-    arch_flags = "-arch=sm_60 " + \
-                 "-gencode=arch=compute_70,code=sm_70 " + \
-                 "-gencode=arch=compute_75,code=sm_75 " + \
-                 "-gencode=arch=compute_75,code=compute_75"
+    arch_flags = "-arch=sm_37 " + \
+                 "-gencode=arch=compute_37,code=sm_37 " + \
+                 "-gencode=arch=compute_37,code=compute_37"
     nvcc_command = "shap/cext/_cext_gpu.cu -lib -o {} -Xcompiler {} -I{} " \
                    "--std c++14 " \
                    "--expt-extended-lambda " \
